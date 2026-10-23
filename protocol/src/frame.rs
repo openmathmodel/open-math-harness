@@ -1,5 +1,7 @@
 //! Length-prefixed framing: a big-endian `u32` byte count, then one JSON
 //! [`Envelope`].
+//! Interrupted reads resume without consuming frame bytes or growing the
+//! call stack. EOF between frames is `Closed`; a partial frame is an I/O error.
 
 use std::fmt;
 use std::io::{self, Read, Write};
@@ -63,11 +65,13 @@ pub fn write_frame<W: Write, M: Serialize>(writer: &mut W, msg: &M) -> Result<()
 /// Reads one frame. The size is checked before any body byte is buffered.
 pub fn read_frame<R: Read, M: DeserializeOwned>(reader: &mut R) -> Result<M, FrameError> {
     let mut prefix = [0u8; 4];
-    match reader.read(&mut prefix[..1]) {
-        Ok(0) => return Err(FrameError::Closed),
-        Ok(_) => {}
-        Err(e) if e.kind() == io::ErrorKind::Interrupted => return read_frame(reader),
-        Err(e) => return Err(FrameError::Io(e)),
+    loop {
+        match reader.read(&mut prefix[..1]) {
+            Ok(0) => return Err(FrameError::Closed),
+            Ok(_) => break,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(FrameError::Io(e)),
+        }
     }
     reader.read_exact(&mut prefix[1..]).map_err(FrameError::Io)?;
     let len = u32::from_be_bytes(prefix) as usize;
@@ -104,6 +108,33 @@ mod tests {
         let msg: ToKernel = read_frame(&mut cursor)?;
         assert_eq!(msg, ToKernel::Cancel { request: RequestId(1) });
         assert!(matches!(read_frame::<_, ToKernel>(&mut cursor), Err(FrameError::Closed)));
+        Ok(())
+    }
+
+    #[test]
+    fn repeated_interruptions_preserve_the_frame_and_clean_close() -> Result<(), FrameError> {
+        struct InterruptedReader {
+            remaining: usize,
+            inner: io::Cursor<Vec<u8>>,
+        }
+
+        impl Read for InterruptedReader {
+            fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+                if self.remaining > 0 {
+                    self.remaining -= 1;
+                    return Err(io::ErrorKind::Interrupted.into());
+                }
+                self.inner.read(buf)
+            }
+        }
+
+        let mut wire = Vec::new();
+        let expected = ToKernel::Cancel { request: RequestId(1) };
+        write_frame(&mut wire, &expected)?;
+        let mut reader = InterruptedReader { remaining: 65_536, inner: io::Cursor::new(wire) };
+        assert_eq!(read_frame::<_, ToKernel>(&mut reader)?, expected);
+        reader.remaining = 65_536;
+        assert!(matches!(read_frame::<_, ToKernel>(&mut reader), Err(FrameError::Closed)));
         Ok(())
     }
 
