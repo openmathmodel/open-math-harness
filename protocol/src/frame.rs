@@ -60,19 +60,18 @@ pub fn write_frame<W: Write, M: Serialize>(writer: &mut W, msg: &M) -> Result<()
     writer.flush().map_err(FrameError::Io)
 }
 
-/// Reads one frame. EOF before the first prefix byte returns
-/// [`FrameError::Closed`]; EOF within the prefix or body returns [`FrameError::Io`].
-/// The declared size is checked before any body byte is buffered.
+/// Reads one frame. EOF before the prefix returns [`FrameError::Closed`];
+/// a partial prefix returns [`FrameError::Io`].
+///
+/// The declared size is checked before buffering the body, returning
+/// [`FrameError::TooLarge`] for an oversized declaration. For an accepted size,
+/// a truncated body returns [`FrameError::Io`].
 pub fn read_frame<R: Read, M: DeserializeOwned>(reader: &mut R) -> Result<M, FrameError> {
     let mut prefix = Vec::with_capacity(4);
-    reader
-        .by_ref()
-        .take(4)
-        .read_to_end(&mut prefix)
-        .map_err(FrameError::Io)?;
-    let prefix: [u8; 4] = match prefix.as_slice() {
+    reader.by_ref().take(4).read_to_end(&mut prefix).map_err(FrameError::Io)?;
+    let prefix: [u8; 4] = match prefix[..] {
         [] => return Err(FrameError::Closed),
-        [a, b, c, d] => [*a, *b, *c, *d],
+        [a, b, c, d] => [a, b, c, d],
         _ => return Err(FrameError::Io(io::ErrorKind::UnexpectedEof.into())),
     };
     let len = u32::from_be_bytes(prefix) as usize;
