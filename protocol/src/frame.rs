@@ -20,7 +20,7 @@ pub const MAX_FRAME_BYTES: usize = 8 << 20;
 /// Why a frame could not be read or written.
 #[derive(Debug)]
 pub enum FrameError {
-    /// The peer closed the channel between frames.
+    /// The stream ended cleanly.
     Closed,
     /// The declared or encoded size exceeds [`MAX_FRAME_BYTES`]. The stream is
     /// no longer in sync and must be dropped.
@@ -60,16 +60,20 @@ pub fn write_frame<W: Write, M: Serialize>(writer: &mut W, msg: &M) -> Result<()
     writer.flush().map_err(FrameError::Io)
 }
 
-/// Reads one frame. The size is checked before any body byte is buffered.
+/// Reads one frame. EOF before the prefix returns [`FrameError::Closed`];
+/// a partial prefix returns [`FrameError::Io`].
+///
+/// The declared size is checked before buffering the body, returning
+/// [`FrameError::TooLarge`] for an oversized declaration. For an accepted size,
+/// a truncated body returns [`FrameError::Io`].
 pub fn read_frame<R: Read, M: DeserializeOwned>(reader: &mut R) -> Result<M, FrameError> {
-    let mut prefix = [0u8; 4];
-    match reader.read(&mut prefix[..1]) {
-        Ok(0) => return Err(FrameError::Closed),
-        Ok(_) => {}
-        Err(e) if e.kind() == io::ErrorKind::Interrupted => return read_frame(reader),
-        Err(e) => return Err(FrameError::Io(e)),
-    }
-    reader.read_exact(&mut prefix[1..]).map_err(FrameError::Io)?;
+    let mut prefix = Vec::with_capacity(4);
+    reader.by_ref().take(4).read_to_end(&mut prefix).map_err(FrameError::Io)?;
+    let prefix: [u8; 4] = match prefix[..] {
+        [] => return Err(FrameError::Closed),
+        [a, b, c, d] => [a, b, c, d],
+        _ => return Err(FrameError::Io(io::ErrorKind::UnexpectedEof.into())),
+    };
     let len = u32::from_be_bytes(prefix) as usize;
     if len > MAX_FRAME_BYTES {
         return Err(FrameError::TooLarge(len));
@@ -105,6 +109,22 @@ mod tests {
         assert_eq!(msg, ToKernel::Cancel { request: RequestId(1) });
         assert!(matches!(read_frame::<_, ToKernel>(&mut cursor), Err(FrameError::Closed)));
         Ok(())
+    }
+
+    #[test]
+    fn eof_is_clean_only_before_the_prefix_starts() {
+        for bytes_read in 0..4 {
+            let input = vec![0; bytes_read];
+            let got = read_frame::<_, ToKernel>(&mut io::Cursor::new(input));
+            if bytes_read == 0 {
+                assert!(matches!(got, Err(FrameError::Closed)));
+            } else {
+                assert!(matches!(
+                    got,
+                    Err(FrameError::Io(error)) if error.kind() == io::ErrorKind::UnexpectedEof
+                ));
+            }
+        }
     }
 
     #[test]
