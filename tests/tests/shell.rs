@@ -24,9 +24,12 @@ fn a_command_leaves_nothing_running_when_it_returns_or_is_withdrawn() {
     let (returned, withdrawn) = (marker(301), marker(302));
     // GNU `timeout` (and its sleep) in a process group of its own, a sleep
     // in a session of its own, both under way before the command goes on.
+    // Newer GNU `timeout` (coreutils 9.11, for one) has its command sent
+    // SIGTERM when it dies (PR_SET_PDEATHSIG); the sleep ignores it, so it
+    // outlives `timeout` on every version and the sweep's next round finds it.
     let leave = |m: &str| {
         format!(
-            "timeout {m} sh -c 'touch {m}.group && exec sleep {m}' & \
+            "timeout {m} sh -c 'trap \"\" TERM; touch {m}.group && exec sleep {m}' & \
              setsid sh -c 'touch {m}.session && exec sleep {m}' & \
              until [ -e {m}.group ] && [ -e {m}.session ]; do sleep 0.01; done; "
         )
