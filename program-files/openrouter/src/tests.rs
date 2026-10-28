@@ -29,6 +29,133 @@ fn options(extra: &[&str]) -> Result<Options, String> {
     Options::parse(args)
 }
 
+/// Local response-size failures do not trigger another provider request.
+#[test]
+fn oversized_response_is_non_retryable() {
+    let key = Secret("k".into());
+    let adapter = Adapter::new(&options(&[]).unwrap(), key.clone());
+    let (error, retry) = adapter.failed(&key, transport::Failure::Limit("response too large"), Again::Soon);
+    assert_eq!(retry, Again::No);
+    assert_eq!(error.code, ErrorCode::ServiceError);
+    assert_eq!(error.message, "response too large");
+}
+
+/// Exercise the complete HTTP path: a provider sends a large unterminated
+/// streaming line. The adapter rejects it locally, and makes no second call.
+#[test]
+fn oversized_provider_response_fails_without_retrying() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let body = vec![b'x'; (8 << 20) + 1];
+    let server = std::thread::spawn(move || {
+        let (mut socket, _) = listener.accept().unwrap();
+        read_request(&socket);
+        let headers = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        socket.write_all(headers.as_bytes()).unwrap();
+        // The adapter may close the socket immediately upon reaching its cap.
+        let _ = socket.write_all(&body);
+        listener.set_nonblocking(true).unwrap();
+        // Again::Soon waits RECONNECT_BACKOFF_MS (2 s) before retrying.
+        // A shorter observation window would miss an unintended second call.
+        let until = Instant::now() + Duration::from_millis(RECONNECT_BACKOFF_MS + 1_000);
+        while Instant::now() < until {
+            match listener.accept() {
+                Ok(_) => return Ok(true),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(false)
+    });
+    let adapter = Adapter::new(
+        &options(&["--base-url", &base, "--retries", "3", "--retry-backoff-ms", "10"]).unwrap(),
+        Secret("k".into()),
+    );
+    let failure = adapter.complete("deepseek/x", &request(), Duration::from_secs(15)).unwrap_err();
+    assert_eq!(failure.code, ErrorCode::ServiceError);
+    assert!(failure.message.contains("8 MiB"), "{}", failure.message);
+    assert!(!server.join().unwrap().unwrap(), "unexpected retry request");
+}
+
+/// A non-successful streaming response must preserve a local size-limit
+/// failure. An empty fallback body would instead permit retries for 503.
+#[test]
+fn oversized_error_body_in_stream_is_not_retried() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let server = std::thread::spawn(move || {
+        let (mut socket, _) = listener.accept().unwrap();
+        read_request(&socket);
+        let body = vec![b'x'; (8 << 20) + 1];
+        let headers = format!(
+            "HTTP/1.1 503 Service Unavailable\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        socket.write_all(headers.as_bytes()).unwrap();
+        // The client is allowed to close as soon as the local limit is hit.
+        let _ = socket.write_all(&body);
+        listener.set_nonblocking(true).unwrap();
+        let until = Instant::now() + Duration::from_millis(RECONNECT_BACKOFF_MS + 1_000);
+        while Instant::now() < until {
+            match listener.accept() {
+                Ok(_) => return Ok(true),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(false)
+    });
+    let adapter = Arc::new(Adapter::new(
+        &options(&["--base-url", &base, "--retries", "3", "--retry-backoff-ms", "10"]).unwrap(),
+        Secret("k".into()),
+    ));
+    let streams = Streams::default();
+    let id = start(&adapter, &streams, 15_000);
+    let error = loop {
+        match pull(&streams, &id) {
+            Ok(next) => assert!(next.delta.is_empty() && next.done.is_none()),
+            Err(error) => break error,
+        }
+    };
+    assert_eq!(error.code, ErrorCode::ServiceError, "{}", error.message);
+    assert!(error.message.contains("8 MiB"), "{}", error.message);
+    assert!(!server.join().unwrap().unwrap(), "unexpected retry request");
+}
+
+/// The HTTP status still determines retryability if the provider's error
+/// body cannot be decoded. Credential/credit refusals must stay final.
+#[test]
+fn malformed_provider_error_body_preserves_status_retry_policy() {
+    for (status, expected) in [(402, Again::No), (403, Again::No), (503, Again::Later)] {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            read_request(&socket);
+            let reply = format!("HTTP/1.1 {status} X\r\nContent-Length: 1\r\nConnection: close\r\n\r\n");
+            socket.write_all(reply.as_bytes()).unwrap();
+            socket.write_all(&[0xff]).unwrap();
+        });
+        let adapter = Adapter::new(&options(&["--base-url", &base]).unwrap(), Secret("k".into()));
+        let streams = Streams::default();
+        let (_, feed) = streams.open(ProcessId(1), Instant::now() + Duration::from_secs(10)).unwrap();
+        let (error, retry) = adapter
+            .stream_inner("deepseek/x", &request(), Instant::now() + Duration::from_secs(10), &feed)
+            .unwrap_err();
+        server.join().unwrap();
+        assert_eq!(retry, expected, "status {status}: {}", error.message);
+        assert_eq!(error.code, ErrorCode::ServiceError);
+        assert!(error.message.contains("UTF-8"), "status {status}: {}", error.message);
+    }
+}
+
 /// Reads one HTTP request from `socket`, headers and body, and returns the body.
 fn read_request(socket: &TcpStream) -> Vec<u8> {
     socket.set_read_timeout(Some(Duration::from_secs(5))).unwrap();

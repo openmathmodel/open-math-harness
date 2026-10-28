@@ -17,6 +17,7 @@
 //! those waits; between them the connection is not read, which is the
 //! backpressure a slow consumer puts on the provider.
 
+use std::collections::VecDeque;
 use std::future::Future;
 use std::time::{Duration, Instant};
 
@@ -29,6 +30,10 @@ use crate::Secret;
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// How often a wait looks at its deadline and its caller's `alive` check.
 pub const CHECK_EVERY: Duration = Duration::from_millis(50);
+/// Maximum unconsumed provider bytes held across queued response lines.
+const MAX_PENDING_BYTES: usize = 8 << 20;
+/// Maximum body bytes collected for a non-streaming completion or error.
+const MAX_TEXT_BYTES: usize = 16 << 20;
 
 /// Why an exchange stopped without an answer from the provider.
 #[derive(Debug)]
@@ -42,6 +47,8 @@ pub enum Failure {
     Send { unreachable: bool, detail: String },
     /// The response broke off while it was being read.
     Read(String),
+    /// A provider response exceeded a local memory-safety limit; do not retry.
+    Limit(&'static str),
 }
 
 /// A request that reached the provider and got a status line back. Dropping
@@ -53,7 +60,9 @@ pub struct Exchange {
     runtime: Runtime,
     deadline: Instant,
     /// Body bytes read but not yet handed out as a line.
-    pending: Vec<u8>,
+    pending: VecDeque<u8>,
+    /// Bytes of the current unterminated line already searched for '\n'.
+    scanned: usize,
     ended: bool,
 }
 
@@ -113,7 +122,7 @@ fn send(
         unreachable: e.is_connect() || e.is_timeout(),
         detail: chain(&e),
     })?;
-    Ok(Exchange { response, runtime, deadline, pending: Vec::new(), ended: false })
+    Ok(Exchange { response, runtime, deadline, pending: VecDeque::new(), scanned: 0, ended: false })
 }
 
 impl Exchange {
@@ -122,24 +131,24 @@ impl Exchange {
     }
 
     /// The next line of the body without its line ending, or `None` at the
-    /// end. A last line without a line ending is still a line. Lines are not
-    /// bounded in length. A line is handed on as soon as it is whole; the
-    /// request deadline and upstream provider govern generation.
+    /// end. A last line without a line ending is still a line. At most
+    /// MAX_PENDING_BYTES unconsumed response bytes are retained. A deque
+    /// avoids shifting the rest of a large chunk for every short SSE line.
     pub fn line(&mut self, alive: &dyn Fn() -> bool) -> Result<Option<String>, Failure> {
         loop {
-            if let Some(at) = self.pending.iter().position(|byte| *byte == b'\n') {
-                let line: Vec<u8> = self.pending.drain(..=at).collect();
+            if let Some(line) = next_line(&mut self.pending, &mut self.scanned) {
                 return text(&line).map(Some);
             }
             if self.ended {
                 if self.pending.is_empty() {
                     return Ok(None);
                 }
-                let line = std::mem::take(&mut self.pending);
+                let line: Vec<u8> = self.pending.drain(..).collect();
+                self.scanned = 0;
                 return text(&line).map(Some);
             }
             match self.runtime.drive(self.response.chunk(), self.deadline, alive)? {
-                Ok(Some(chunk)) => self.pending.extend_from_slice(&chunk),
+                Ok(Some(chunk)) => append_pending(&mut self.pending, &chunk)?,
                 Ok(None) => self.ended = true,
                 Err(e) => return Err(Failure::Read(chain(&e))),
             }
@@ -150,8 +159,7 @@ impl Exchange {
     pub fn text(&mut self, alive: &dyn Fn() -> bool) -> Result<String, Failure> {
         let mut all = String::new();
         while let Some(line) = self.line(alive)? {
-            all.push_str(&line);
-            all.push('\n');
+            append_text_line(&mut all, &line)?;
         }
         Ok(all)
     }
@@ -161,6 +169,45 @@ fn text(line: &[u8]) -> Result<String, Failure> {
     let line = std::str::from_utf8(line)
         .map_err(|_| Failure::Read("the provider sent a line that is not UTF-8".to_owned()))?;
     Ok(line.trim_end_matches(['\n', '\r']).to_owned())
+}
+
+/// Drain a complete response line, searching only bytes added since the last
+/// unsuccessful search. This makes a long line arriving one byte per chunk
+/// linear in its length instead of repeatedly scanning its prefix.
+fn next_line(pending: &mut VecDeque<u8>, scanned: &mut usize) -> Option<Vec<u8>> {
+    debug_assert!(*scanned <= pending.len());
+    match pending.range(*scanned..).position(|byte| *byte == b'\n') {
+        Some(relative) => {
+            let end = *scanned + relative + 1;
+            *scanned = 0;
+            Some(pending.drain(..end).collect())
+        }
+        None => {
+            *scanned = pending.len();
+            None
+        }
+    }
+}
+
+/// Refuse to retain more response bytes than the buffer holds. Reqwest has
+/// already allocated each chunk; this bounds the adapter's pending deque,
+/// not all process memory.
+fn append_pending(pending: &mut VecDeque<u8>, chunk: &[u8]) -> Result<(), Failure> {
+    if chunk.len() > MAX_PENDING_BYTES.saturating_sub(pending.len()) {
+        return Err(Failure::Limit("provider response buffer exceeds 8 MiB"));
+    }
+    pending.extend(chunk.iter().copied());
+    Ok(())
+}
+
+/// Apply a separate total limit when the whole response is collected.
+fn append_text_line(all: &mut String, line: &str) -> Result<(), Failure> {
+    if line.len().saturating_add(1) > MAX_TEXT_BYTES.saturating_sub(all.len()) {
+        return Err(Failure::Limit("provider response body exceeds 16 MiB"));
+    }
+    all.push_str(line);
+    all.push('\n');
+    Ok(())
 }
 
 /// An attempt's runtime, shut down without waiting when it is dropped.
@@ -236,6 +283,90 @@ mod tests {
     use std::sync::{Arc, Mutex, mpsc};
 
     use super::*;
+
+    /// An unterminated provider line or excessive pending network data must
+    /// never grow the adapter-owned byte buffer past its limit.
+    #[test]
+    fn pending_provider_bytes_have_an_exact_bound() {
+        let mut pending = VecDeque::from(vec![b'x'; MAX_PENDING_BYTES - 1]);
+        append_pending(&mut pending, b"y").unwrap();
+        assert_eq!(pending.len(), MAX_PENDING_BYTES);
+        assert!(matches!(append_pending(&mut pending, b"z"), Err(Failure::Limit(_))));
+        assert_eq!(pending.len(), MAX_PENDING_BYTES);
+
+        let mut empty = VecDeque::new();
+        let oversized = vec![b'x'; MAX_PENDING_BYTES + 1];
+        assert!(matches!(append_pending(&mut empty, &oversized), Err(Failure::Limit(_))));
+        assert!(empty.is_empty());
+        append_pending(&mut empty, b"one\ntwo\n").unwrap();
+        assert_eq!(empty.into_iter().collect::<Vec<_>>(), b"one\ntwo\n".to_vec());
+    }
+
+    /// Scanning a long line split into tiny chunks must avoid repeatedly
+    /// searching its existing prefix. Short lines in one chunk remain ordered.
+    #[test]
+    fn searches_each_provider_byte_only_once_across_chunks() {
+        let mut pending = VecDeque::new();
+        let mut scanned = 0;
+        for n in 1..=16_384 {
+            append_pending(&mut pending, b"x").unwrap();
+            assert!(next_line(&mut pending, &mut scanned).is_none());
+            assert_eq!(scanned, n);
+        }
+        append_pending(&mut pending, b"\nsecond\n").unwrap();
+        let first = next_line(&mut pending, &mut scanned).unwrap();
+        assert_eq!(first.len(), 16_385);
+        assert_eq!(first.last(), Some(&b'\n'));
+        assert_eq!(next_line(&mut pending, &mut scanned).unwrap(), b"second\n".to_vec());
+        assert!(next_line(&mut pending, &mut scanned).is_none());
+        assert_eq!(scanned, 0);
+    }
+
+    /// Every network-chunk split must preserve response lines, including
+    /// empty lines, CRLF and multibyte UTF-8 split across chunks.
+    #[test]
+    fn response_line_parser_preserves_all_two_chunk_fragmentations() {
+        let input = "α\n\nβ\r\nfinal";
+        for split in 0..=input.len() {
+            let mut pending = VecDeque::new();
+            let mut scanned = 0;
+            let mut lines: Vec<Vec<u8>> = Vec::new();
+            for chunk in [&input.as_bytes()[..split], &input.as_bytes()[split..]] {
+                append_pending(&mut pending, chunk).unwrap();
+                while let Some(line) = next_line(&mut pending, &mut scanned) {
+                    lines.push(line);
+                }
+            }
+            if !pending.is_empty() {
+                lines.push(pending.drain(..).collect());
+            }
+            let decoded: Vec<String> = lines.iter().map(|line| text(line).unwrap()).collect();
+            assert_eq!(
+                decoded,
+                vec!["α".to_owned(), "".to_owned(), "β".to_owned(), "final".to_owned()],
+                "split: {split}"
+            );
+        }
+    }
+
+    /// Several valid lines must respect the total response bound. Rejection
+    /// must leave the already collected response unchanged.
+    #[test]
+    fn collected_provider_body_has_an_exact_bound() {
+        let mut all = String::new();
+        let quarter = "x".repeat(MAX_TEXT_BYTES / 4 - 1);
+        for _ in 0..4 {
+            append_text_line(&mut all, &quarter).unwrap();
+        }
+        assert_eq!(all.len(), MAX_TEXT_BYTES);
+        assert!(matches!(append_text_line(&mut all, "y"), Err(Failure::Limit(_))));
+        assert_eq!(all.len(), MAX_TEXT_BYTES);
+
+        let mut short = String::new();
+        append_text_line(&mut short, "one").unwrap();
+        append_text_line(&mut short, "two").unwrap();
+        assert_eq!(short, "one\ntwo\n");
+    }
 
     /// Looks a name up the way the system resolver does (hyper-util's
     /// `GaiResolver`): a blocking call on the runtime's blocking pool. The

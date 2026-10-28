@@ -433,6 +433,7 @@ impl Adapter {
                 };
                 (Error::new(ErrorCode::ServiceError, key.scrub(&format!("{what}: {detail}"))), Again::Soon)
             }
+            Failure::Limit(detail) => (Error::new(ErrorCode::ServiceError, detail), Again::No),
             Failure::Read(detail) => (
                 Error::new(
                     ErrorCode::ServiceError,
@@ -628,17 +629,20 @@ impl Adapter {
             ));
         }
         if !(200..300).contains(&status) {
-            let text = exchange.text(&alive).unwrap_or_default();
+            // Preserve the HTTP status retry policy if reading the error
+            // body fails. A local size-limit failure remains final as well.
+            let text = exchange
+                .text(&alive)
+                .map_err(|failure| self.failed(&key, failure, transient_status(status)))?;
             return wire::parse_response(status, &text, model).map_err(|e| {
                 let again = retry_for(&e, transient_status(status));
                 (Error::new(e.code, key.scrub(&e.message)), again)
             });
         }
         let mut assembler = wire::StreamAssembler::default();
-        // Unbounded for the same reason, and more sharply: this stream is
-        // consumed a line at a time and never held, so its length costs
-        // nothing. What grows is the assembled reply, and that is bounded by
-        // the tokens the request allows.
+        // The transport bounds unconsumed provider bytes. The assembler stores
+        // reply fragments separately; the requested token budget is enforced
+        // by the provider, not a local bound on assembler memory.
         let (mut thought, mut called) = (0, 0);
         while let Some(line) =
             exchange.line(&alive).map_err(|failure| self.failed(&key, failure, again(delivered)))?
