@@ -1,0 +1,391 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Nucleus Box</title>
+<style>
+  :root { color-scheme: light dark; --line: #8884; --muted: #888; --accent: #2f6fdb; --bad: #c0392b; --soft: #8881; }
+  body { margin: 0; font: 14px/1.5 system-ui, sans-serif; }
+  header { padding: 10px 16px; border-bottom: 1px solid var(--line); display: flex; gap: 12px; align-items: baseline; }
+  header h1 { font-size: 16px; margin: 0; }
+  main { display: grid; grid-template-columns: 220px 1fr; min-height: calc(100vh - 44px); }
+  aside { border-right: 1px solid var(--line); padding: 12px; }
+  section { padding: 12px 16px; min-width: 0; }
+  h2 { font-size: 13px; color: var(--muted); margin: 0 0 8px; font-weight: 600; }
+  ul { list-style: none; margin: 0; padding: 0; }
+  li { padding: 4px 6px; border-radius: 4px; cursor: pointer; display: flex; justify-content: space-between; gap: 8px; }
+  li:hover { background: var(--soft); }
+  li.active { background: #2f6fdb22; }
+  .muted { color: var(--muted); }
+  .crumbs span { cursor: pointer; color: var(--accent); }
+  button { font: inherit; padding: 4px 10px; border: 1px solid var(--line); border-radius: 4px; background: transparent; color: inherit; cursor: pointer; }
+  button.primary { background: var(--accent); color: #fff; border-color: var(--accent); }
+  button.tab.active { border-color: var(--accent); color: var(--accent); }
+  input { font: inherit; padding: 4px 6px; border: 1px solid var(--line); border-radius: 4px; background: transparent; color: inherit; }
+  textarea { width: 100%; font: 13px/1.5 ui-monospace, Menlo, monospace; padding: 10px; box-sizing: border-box; border: 1px solid var(--line); border-radius: 4px; background: transparent; color: inherit; }
+  #text { min-height: 60vh; }
+  #say { min-height: 4.5em; font-family: inherit; }
+  .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin: 8px 0; }
+  .notice { padding: 8px 10px; border-radius: 4px; margin: 8px 0; }
+  .notice.bad { border: 1px solid var(--bad); color: var(--bad); }
+  .notice.ok { border: 1px solid #2e8b57; color: #2e8b57; }
+  .chatgrid { display: grid; grid-template-columns: 220px 1fr; gap: 16px; }
+  .log { border: 1px solid var(--line); border-radius: 4px; height: 58vh; overflow: auto; padding: 8px 12px; }
+  .msg { margin: 8px 0; white-space: pre-wrap; overflow-wrap: anywhere; }
+  .msg.user { background: var(--soft); padding: 6px 10px; border-radius: 6px; }
+  .msg.tool { color: var(--muted); font-size: 12px; }
+  .msg.error { color: var(--bad); }
+  @media (max-width: 760px) { main, .chatgrid { grid-template-columns: 1fr; } aside { border-right: 0; border-bottom: 1px solid var(--line); } }
+</style>
+</head>
+<body>
+<header><h1>Nucleus Box</h1><span class="muted" id="status">接続中…</span></header>
+<main>
+  <aside>
+    <h2>プロジェクト</h2>
+    <ul id="projects"></ul>
+    <div class="row"><input id="newName" placeholder="name (a-z0-9-)" size="14"><button id="create">作成</button></div>
+  </aside>
+  <section>
+    <div id="intro" class="muted">プロジェクトを選んでください。</div>
+    <div id="tabs" class="row" hidden>
+      <button class="tab" data-tab="chat">チャット</button>
+      <button class="tab" data-tab="files">ファイル</button>
+    </div>
+    <div id="chat" hidden>
+      <div class="chatgrid">
+        <div>
+          <h2>セッション</h2>
+          <ul id="sessions"></ul>
+          <div class="row"><input id="newSession" placeholder="session name" size="16"></div>
+          <div class="row"><input id="newModel" value="opencode/deepseek-v4.1-flash" size="26"></div>
+          <div class="row"><button id="makeSession">セッション作成</button></div>
+        </div>
+        <div>
+          <div class="row"><strong id="sessionName" class="muted">セッションを選んでください</strong></div>
+          <div id="log" class="log"></div>
+          <div id="chatNotice"></div>
+          <textarea id="say" placeholder="メッセージ（Ctrl+Enter で送信）"></textarea>
+          <div class="row">
+            <button class="primary" id="send">送信</button>
+            <button id="stop">停止</button>
+          </div>
+        </div>
+      </div>
+    </div>
+    <div id="files" hidden>
+      <div id="browser"></div>
+      <div id="editor" hidden>
+        <div class="row"><strong id="openName"></strong><span class="muted" id="openInfo"></span></div>
+        <div id="notice"></div>
+        <textarea id="text" spellcheck="false"></textarea>
+        <div class="row">
+          <button class="primary" id="save">保存</button>
+          <button id="reload">再読み込み</button>
+          <button id="close">閉じる</button>
+        </div>
+      </div>
+    </div>
+  </section>
+</main>
+<script>
+const CHUNK = 256 * 1024;
+const state = { project: null, dir: "", open: null, revision: null };
+const chat = { session: null, timer: null };
+const $ = (id) => document.getElementById(id);
+
+// Everything shown from the runtime (names, file contents, model output) is
+// untrusted, so it is only ever set as text, never as HTML.
+function el(tag, props = {}, ...children) {
+  const node = document.createElement(tag);
+  Object.assign(node, props);
+  for (const c of children) node.append(c);
+  return node;
+}
+
+async function ui(op, body = {}) {
+  const res = await fetch("/api/ui", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ op, ...body }),
+  });
+  if (!res.ok && res.headers.get("Content-Type") !== "application/json") throw new Error(`HTTP ${res.status}`);
+  const reply = await res.json();
+  if (reply.error) throw new Error(`${reply.error.code}: ${reply.error.message}`);
+  return reply.ok;
+}
+
+function bytesToBase64(bytes) {
+  let s = "";
+  for (let i = 0; i < bytes.length; i += 0x8000) s += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
+  return btoa(s);
+}
+function base64ToBytes(b64) {
+  return Uint8Array.from(atob(b64), (c) => c.charCodeAt(0));
+}
+function show(target, text, kind = "bad") {
+  $(target).replaceChildren(...(text ? [el("div", { className: `notice ${kind}`, textContent: text })] : []));
+}
+const notice = (text, kind) => show("notice", text, kind);
+const report = (e) => notice(e.message);
+const chatReport = (e) => show("chatNotice", e.message);
+function join(dir, name) { return dir ? `${dir}/${name}` : name; }
+
+async function loadProjects() {
+  const { projects } = await ui("projects.list");
+  $("projects").replaceChildren(...projects.map((p) => {
+    const li = el("li", { textContent: p.name, className: p.name === state.project ? "active" : "" });
+    li.onclick = () => openProject(p.name);
+    return li;
+  }));
+  $("status").textContent = `接続済み · ${projects.length} projects`;
+}
+
+function openProject(name) {
+  state.project = name;
+  state.dir = "";
+  closeFile();
+  stopSession();
+  $("intro").hidden = true;
+  $("tabs").hidden = false;
+  loadProjects().catch(report);
+  showTab("chat");
+}
+
+function showTab(tab) {
+  document.querySelectorAll("button.tab").forEach((b) => b.classList.toggle("active", b.dataset.tab === tab));
+  $("chat").hidden = tab !== "chat";
+  $("files").hidden = tab !== "files";
+  if (tab === "chat") loadSessions().catch(chatReport);
+  else showDir().catch(report);
+}
+document.querySelectorAll("button.tab").forEach((b) => (b.onclick = () => showTab(b.dataset.tab)));
+
+// ---- Files ----
+
+async function showDir() {
+  const { entries } = await ui("files.list", { dir: state.project, path: state.dir });
+  const crumbs = el("div", { className: "crumbs" });
+  const crumb = (label, to) => { const s = el("span", { textContent: label }); s.onclick = () => { state.dir = to; closeFile(); showDir().catch(report); }; return s; };
+  crumbs.append(crumb(state.project, ""));
+  let acc = "";
+  for (const part of state.dir.split("/").filter(Boolean)) {
+    acc = join(acc, part);
+    crumbs.append(" / ", crumb(part, acc));
+  }
+  const newFile = el("input", { placeholder: "new file name", size: 20 });
+  const makeFile = el("button", { textContent: "新規ファイル" });
+  const newDir = el("input", { placeholder: "new folder", size: 14 });
+  const makeDir = el("button", { textContent: "フォルダ作成" });
+  makeFile.onclick = () => { const n = newFile.value.trim(); if (n) openFile(join(state.dir, n), true).catch(report); };
+  makeDir.onclick = () => { const n = newDir.value.trim(); if (n) ui("files.mkdir", { dir: state.project, path: join(state.dir, n) }).then(showDir).catch(report); };
+  const list = el("ul");
+  const sorted = [...entries].sort((a, c) => (a.kind === "dir" ? 0 : 1) - (c.kind === "dir" ? 0 : 1) || a.name.localeCompare(c.name));
+  if (!sorted.length) list.append(el("li", { className: "muted", textContent: "空のフォルダです" }));
+  for (const e of sorted) {
+    const li = el("li", {},
+      el("span", { textContent: (e.kind === "dir" ? "📁 " : "📄 ") + e.name }),
+      el("span", { className: "muted", textContent: e.kind === "dir" ? "" : `${e.size} B` }));
+    li.onclick = () => e.kind === "dir"
+      ? (state.dir = join(state.dir, e.name), closeFile(), showDir().catch(report))
+      : openFile(join(state.dir, e.name)).catch(report);
+    list.append(li);
+  }
+  $("browser").replaceChildren(crumbs, el("div", { className: "row" }, newFile, makeFile, newDir, makeDir), list);
+}
+
+// Reads every chunk; the revision is the first one's, and a later chunk
+// with another revision means the file changed while it was read.
+async function readFile(path) {
+  let offset = 0, revision = null;
+  const parts = [];
+  for (;;) {
+    const r = await ui("files.download", { dir: state.project, path, offset });
+    if (revision === null) revision = r.revision;
+    else if (r.revision !== revision) throw new Error("ファイルが読み込み中に変わりました。再読み込みしてください。");
+    parts.push(base64ToBytes(r.data_base64));
+    if (r.next_offset == null) break;
+    offset = r.next_offset;
+  }
+  const bytes = new Uint8Array(parts.reduce((n, p) => n + p.length, 0));
+  let at = 0;
+  for (const p of parts) { bytes.set(p, at); at += p.length; }
+  return { text: new TextDecoder("utf-8", { fatal: true }).decode(bytes), revision };
+}
+
+// Saves through the editor's conditional path: the host refuses (conflict)
+// when the file is no longer the revision this text was based on.
+async function saveFile(path, text, revision) {
+  const bytes = new TextEncoder().encode(text);
+  const uploadId = crypto.randomUUID();
+  let offset = 0;
+  for (;;) {
+    const end = Math.min(offset + CHUNK, bytes.length);
+    const last = end >= bytes.length;
+    const body = { dir: state.project, path, offset, data_base64: bytesToBase64(bytes.subarray(offset, end)), last };
+    if (revision) Object.assign(body, { replace: true, expected_revision: revision, upload_id: uploadId });
+    const r = await ui("files.upload", body);
+    if (r.conflict) return { conflict: true };
+    offset = end;
+    if (last) return { revision: r.revision, size: bytes.length };
+  }
+}
+
+async function openFile(path, isNew = false) {
+  closeFile();
+  $("editor").hidden = false;
+  $("openName").textContent = path;
+  state.open = path;
+  if (isNew) {
+    state.revision = null;
+    $("text").value = "";
+    $("openInfo").textContent = "新規";
+  } else {
+    const { text, revision } = await readFile(path);
+    state.revision = revision;
+    $("text").value = text;
+    $("openInfo").textContent = `${new TextEncoder().encode(text).length} B`;
+  }
+  notice("");
+}
+
+function closeFile() {
+  state.open = null;
+  state.revision = null;
+  $("editor").hidden = true;
+  notice("");
+}
+
+$("save").onclick = async () => {
+  try {
+    const r = await saveFile(state.open, $("text").value, state.revision);
+    if (r.conflict) return notice("保存できませんでした: 別の場所で変更されています。再読み込みしてから編集し直してください。");
+    state.revision = r.revision;
+    $("openInfo").textContent = `${r.size} B`;
+    notice("保存しました。", "ok");
+    showDir().catch(report);
+  } catch (e) { report(e); }
+};
+$("reload").onclick = () => openFile(state.open, false).catch(report);
+$("close").onclick = () => { closeFile(); showDir().catch(report); };
+
+// ---- Chat ----
+
+async function loadSessions() {
+  const { sessions } = await ui("sessions.list");
+  const mine = sessions.filter((s) => s.project === state.project);
+  $("sessions").replaceChildren(...(mine.length ? mine.map((s) => {
+    const li = el("li", { className: s.name === chat.session ? "active" : "" },
+      el("span", { textContent: s.name }),
+      el("span", { className: "muted", textContent: (s.model || "").split("/").pop() }));
+    li.onclick = () => openSession(s.name);
+    return li;
+  }) : [el("li", { className: "muted", textContent: "セッションはまだありません" })]));
+}
+
+function stopSession() {
+  clearTimeout(chat.timer);
+  chat.session = null;
+  $("sessionName").textContent = "セッションを選んでください";
+  $("log").replaceChildren();
+  show("chatNotice", "");
+}
+
+function openSession(name) {
+  stopSession();
+  chat.session = name;
+  $("sessionName").textContent = name;
+  loadSessions().catch(chatReport);
+  refresh().catch(chatReport);
+}
+
+async function fetchHistory() {
+  const records = [];
+  let after = null;
+  for (;;) {
+    const page = await ui("conversation.history", { project: state.project, session: chat.session, after_seq: after });
+    records.push(...page.records);
+    if (!page.has_more || !page.records.length) return records;
+    after = page.records[page.records.length - 1].seq;
+  }
+}
+
+// Draws the conversation and says whether a turn is still open. A provisional
+// piece (`assistant_delta`) is dropped once its final `assistant` entry exists.
+function render(records) {
+  const final = new Set(records.filter((r) => r.kind === "assistant" && r.message_id).map((r) => r.message_id));
+  const pieces = new Map();
+  const nodes = [];
+  let open = false;
+  for (const r of records) {
+    const line = (cls, text) => { const node = el("div", { className: `msg ${cls}`, textContent: text }); nodes.push(node); return node; };
+    switch (r.kind) {
+      case "user": line("user", r.text); open = true; break;
+      case "assistant": line("assistant", r.text); break;
+      case "assistant_delta":
+        if (final.has(r.message_id)) break;
+        if (pieces.has(r.message_id)) pieces.get(r.message_id).textContent += r.text;
+        else pieces.set(r.message_id, line("assistant", r.text));
+        break;
+      case "tool_call": line("tool", `🔧 ${r.name}`); break;
+      case "tool_result": line("tool", `↳ ${r.summary}`); break;
+      case "error": line("error", r.text); break;
+      case "turn_complete": case "interrupted": open = false; break;
+    }
+  }
+  const log = $("log");
+  const atBottom = log.scrollHeight - log.scrollTop - log.clientHeight < 40;
+  log.replaceChildren(...nodes);
+  if (atBottom) log.scrollTop = log.scrollHeight;
+  return open;
+}
+
+async function refresh() {
+  const session = chat.session;
+  if (!session) return;
+  const records = await fetchHistory();
+  if (chat.session !== session) return;
+  const open = render(records);
+  clearTimeout(chat.timer);
+  if (open) chat.timer = setTimeout(() => refresh().catch(chatReport), 1500);
+}
+
+async function send() {
+  const text = $("say").value.trim();
+  if (!chat.session || !text) return;
+  try {
+    await ui("conversation.say", { project: state.project, session: chat.session, message_id: crypto.randomUUID(), text });
+    $("say").value = "";
+    show("chatNotice", "");
+    await refresh();
+  } catch (e) { chatReport(e); }
+}
+$("send").onclick = send;
+$("say").onkeydown = (e) => { if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) { e.preventDefault(); send(); } };
+$("stop").onclick = () => chat.session && ui("sessions.interrupt", { project: state.project, session: chat.session }).then(refresh).catch(chatReport);
+$("makeSession").onclick = async () => {
+  const name = $("newSession").value.trim();
+  const model = $("newModel").value.trim();
+  if (!name || !model) return;
+  try {
+    await ui("sessions.create", { project: state.project, session: name, model });
+    $("newSession").value = "";
+    openSession(name);
+  } catch (e) { chatReport(e); }
+};
+
+$("create").onclick = async () => {
+  const name = $("newName").value.trim();
+  if (!name) return;
+  try {
+    await ui("projects.create", { name });
+    $("newName").value = "";
+    openProject(name);
+  } catch (e) { report(e); }
+};
+
+ui("whoami").then(loadProjects).catch((e) => ($("status").textContent = "接続できません: " + e.message));
+</script>
+</body>
+</html>
