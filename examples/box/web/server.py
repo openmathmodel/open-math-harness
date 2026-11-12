@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Local web front end for a development box's Nucleus UI socket.
 
-    server.py <ui-socket> [port]
+    server.py <ui-socket> [port] [--allow-login LOGIN ...]
 
 Serves index.html on 127.0.0.1 and relays a fixed set of UI operations to the
 socket. The relay holds no authority of its own: each request goes to the
@@ -9,18 +9,28 @@ socket as the owner's window (the label below), and the kernel decides every
 call against what the composition grants that window. Only the operations in
 ALLOWED are relayed.
 
-No login. Whoever can reach this port can do what the owner's window can do
-in this composition, so it listens on 127.0.0.1 only and is for a single
-development machine. Do not bind it to a shared or public address.
+There is no login of its own, and it listens on 127.0.0.1 only. Whoever can
+reach the port can do what the owner's window can do in this composition.
+
+`--allow-login` is for a port that `tailscale serve` forwards to: each request
+must then carry a `Tailscale-User-Login` header naming one of the given logins,
+which tailscale serve sets from the tailnet identity of the caller. The header
+is trusted because only processes on this machine reach 127.0.0.1, and those
+are trusted already; never forward a public or shared address to such a port.
 """
+import argparse
 import json
 import pathlib
 import socket
 import sys
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-SOCKET = sys.argv[1] if len(sys.argv) > 1 else "run/ui.sock"
-PORT = int(sys.argv[2]) if len(sys.argv) > 2 else 8080
+parser = argparse.ArgumentParser()
+parser.add_argument("socket")
+parser.add_argument("port", nargs="?", type=int, default=8080)
+parser.add_argument("--allow-login", action="append", default=[])
+OPTIONS = parser.parse_args()
+
 PAGE = pathlib.Path(__file__).with_name("index.html")
 LABEL = {"v": 1, "kind": "window", "account": "box-owner", "nickname": "box", "role": "owner"}
 ALLOWED = {
@@ -32,6 +42,11 @@ ALLOWED = {
     "files.upload",
     "files.mkdir",
     "files.remove",
+    "sessions.list",
+    "sessions.create",
+    "sessions.interrupt",
+    "conversation.say",
+    "conversation.history",
 }
 MAX_BODY = 2 * 1024 * 1024
 
@@ -41,7 +56,7 @@ def ui_call(payload):
     conn = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     conn.settimeout(120)
     try:
-        conn.connect(SOCKET)
+        conn.connect(OPTIONS.socket)
         io = conn.makefile("rwb")
         io.write((json.dumps(LABEL) + "\n").encode())
         io.write((json.dumps({"id": 1, **payload}) + "\n").encode())
@@ -63,12 +78,24 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _admitted(self):
+        if not OPTIONS.allow_login:
+            return True
+        if self.headers.get("Tailscale-User-Login") in OPTIONS.allow_login:
+            return True
+        self._send(403, b"forbidden", "text/plain; charset=utf-8")
+        return False
+
     def do_GET(self):
+        if not self._admitted():
+            return
         if self.path in ("/", "/index.html"):
             return self._send(200, PAGE.read_bytes(), "text/html; charset=utf-8")
         self._send(404, b"not found", "text/plain; charset=utf-8")
 
     def do_POST(self):
+        if not self._admitted():
+            return
         if self.path != "/api/ui":
             return self._send(404, b"not found", "text/plain; charset=utf-8")
         length = int(self.headers.get("Content-Length", "0"))
@@ -91,4 +118,4 @@ class Handler(BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
-    ThreadingHTTPServer(("127.0.0.1", PORT), Handler).serve_forever()
+    ThreadingHTTPServer(("127.0.0.1", OPTIONS.port), Handler).serve_forever()
