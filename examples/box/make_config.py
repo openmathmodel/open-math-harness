@@ -11,8 +11,9 @@ from deploy/vm/nucleus.json and keeps only what these services need:
 - Project identities are off, so no spawn_as or stop_project grant remains.
 - The programs directory is bound at /programs, so spawn grants name it.
 - The chat agent may use the conversation, model and fs endpoints only: its
-  repository scope is files, its tool bindings are the file tools, and it
-  holds no project, session, approval, memory, web or shell authority.
+  repository scope is files, its tool bindings are the file tools, it holds no
+  project, session, approval, memory, web or shell authority, and its
+  children get no network.
 - The UI keeps no deletion or archiving authority (its deletion workflow
   needs every service's stop grant) and no session `forget`.
 
@@ -93,6 +94,9 @@ def narrowed(args):
         elif flag == "--execution-context":
             context = json.loads(resolved(value))
             context["programs_dir"] = "/programs"
+            # The chat agent reaches its model through the model endpoint; a
+            # child asking for the network would need a spawner that has it.
+            context["network"] = False
             out += [flag, json.dumps(context)]
             i += 2
         else:
