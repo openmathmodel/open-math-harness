@@ -13,6 +13,7 @@ nucleus-projects-interface.workspace = true
 nucleus-protocol.workspace = true
 nucleus-sdk.workspace = true
 rustix = { version = "1", features = ["fs", "process"] }
+sha2 = "0.10"
 serde.workspace = true
 serde_json.workspace = true
 

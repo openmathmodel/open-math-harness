@@ -4,9 +4,11 @@
 //! partial file where the person or an agent can see it.
 //!
 //! A conditional save (`expected_revision` with `upload_id`) compares the
-//! destination's descriptor metadata (`files::revision`: device, inode, size,
-//! nanosecond mtime and ctime) at the first chunk and again before publishing,
-//! answers `conflict` for a change it observes, and then publishes by rename:
+//! destination's revision (`files::revision`: descriptor metadata, device,
+//! inode, size, nanosecond mtime and ctime, plus a content digest while the
+//! file is too recent for that metadata to show a later write) at the first
+//! chunk and again before publishing, answers `conflict` for a change it
+//! observes, and then publishes by rename:
 //! a shell write or a replacement of the path between that check and the
 //! rename can still race it. It is no lock: the project's processes, all of
 //! the projects' user, take part in no transaction. Its replacement keeps the
@@ -23,8 +25,9 @@ use nucleus_projects_interface::{
 };
 use nucleus_protocol::{Error, ErrorCode};
 use rustix::fs::{AtFlags, FileType, Mode, OFlags, RenameFlags};
+use sha2::{Digest, Sha256};
 
-use crate::files::{parent, revision};
+use crate::files::{hex, parent, revision, unchanged};
 use crate::home::{Home, errno, fresh_name, open_beneath};
 
 fn invalid(message: impl Into<String>) -> Error {
@@ -36,6 +39,8 @@ struct Upload {
     file: std::fs::File,
     size: u64,
     touched: Instant,
+    /// The digest of everything written so far, which is the published content.
+    hash: Sha256,
     expected_revision: Option<String>,
     replace: bool,
 }
@@ -106,7 +111,9 @@ impl Uploads {
                 ));
             }
             let (above, name) = parent(working, &request.path)?;
-            if request.expected_revision.is_some() && checked_destination(&above, name, &request)?.is_none() {
+            if let Some(expected) = &request.expected_revision
+                && checked_destination(&above, name, expected)?.is_none()
+            {
                 return Ok(Uploaded { size: 0, revision: None, conflict: true });
             }
             destination(&above, name, request.replace)?;
@@ -126,6 +133,7 @@ impl Uploads {
                     file: file.into(),
                     size: 0,
                     touched: Instant::now(),
+                    hash: Sha256::new(),
                     expected_revision: request.expected_revision.clone(),
                     replace: request.replace,
                 },
@@ -158,6 +166,7 @@ impl Uploads {
             }
             return Err(e);
         }
+        upload.hash.update(&data);
         upload.size = size;
         upload.touched = Instant::now();
         if !request.last {
@@ -196,8 +205,8 @@ fn publish(
 ) -> Result<Option<String>, Error> {
     upload.file.sync_all().map_err(|e| Error::new(ErrorCode::ServiceError, e.to_string()))?;
     let (above, name) = parent(working, &request.path)?;
-    if request.expected_revision.is_some() {
-        let Some(mode) = checked_destination(&above, name, request)? else { return Ok(None) };
+    if let Some(expected) = &request.expected_revision {
+        let Some(mode) = checked_destination(&above, name, expected)? else { return Ok(None) };
         rustix::fs::fchmod(&upload.file, mode).map_err(|e| errno(name, e))?;
     }
     destination(&above, name, request.replace)?;
@@ -208,16 +217,13 @@ fn publish(
     // A failure after publication has an unknown outcome; it is never safe to replay it.
     let stat =
         rustix::fs::fstat(&upload.file).map_err(|e| Error::new(ErrorCode::UnknownOutcome, e.to_string()))?;
-    Ok(Some(revision(&stat)))
+    revision(&stat, || Ok(hex(&upload.hash.clone().finalize()))).map(Some)
 }
 
-/// Check the opened file, without following links. Publication still has a small
-/// check-to-rename window against arbitrary shell writes; this is not a filesystem CAS.
-fn checked_destination(
-    parent: impl AsFd,
-    name: &str,
-    request: &UploadRequest,
-) -> Result<Option<Mode>, Error> {
+/// Check the opened file, without following links, against the revision the
+/// save was based on. Publication still has a small check-to-rename window
+/// against arbitrary shell writes; this is not a filesystem CAS.
+fn checked_destination(parent: impl AsFd, name: &str, expected: &str) -> Result<Option<Mode>, Error> {
     let fd =
         match open_beneath(parent, name, OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK, Mode::empty())
         {
@@ -226,9 +232,7 @@ fn checked_destination(
             Err(e) => return Err(errno(name, e)),
         };
     let stat = rustix::fs::fstat(&fd).map_err(|e| errno(name, e))?;
-    if FileType::from_raw_mode(stat.st_mode) != FileType::RegularFile
-        || request.expected_revision.as_deref() != Some(revision(&stat).as_str())
-    {
+    if FileType::from_raw_mode(stat.st_mode) != FileType::RegularFile || !unchanged(&fd, &stat, expected)? {
         return Ok(None);
     }
     Ok(Some(Mode::from_raw_mode(stat.st_mode & 0o777)))

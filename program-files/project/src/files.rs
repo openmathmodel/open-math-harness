@@ -8,13 +8,15 @@
 //! stat observation still lists it, without inventing a creation time.
 
 use std::os::fd::{AsFd, OwnedFd};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use base64::Engine;
 use nucleus_projects_interface::{
     CHUNK_BYTES, Chunk, Entry, Kind, Listing, MAX_FILE_BYTES, PAGE_ENTRIES, segments,
 };
 use nucleus_protocol::{Error, ErrorCode};
-use rustix::fs::{AtFlags, FileType, Mode, OFlags, RenameFlags, Statx, StatxFlags};
+use rustix::fs::{AtFlags, FileType, Mode, OFlags, RenameFlags, Stat, Statx, StatxFlags};
+use sha2::{Digest, Sha256};
 
 use crate::home::{Home, errno, fresh_name, open_beneath, open_dir};
 
@@ -49,8 +51,16 @@ fn millis(stat: &rustix::fs::Stat) -> u64 {
     seconds.saturating_mul(1000).saturating_add(nanos / 1_000_000)
 }
 
-/// An observation, not a lock against the project's shell writers.
-pub fn revision(stat: &rustix::fs::Stat) -> String {
+/// A change this recent may share its timestamp with a later one: a filesystem
+/// stamps writes in coarse ticks, so the metadata alone cannot tell them apart.
+const RACY_NANOS: i128 = 2_000_000_000;
+
+/// Separates a revision's metadata from its content digest. Neither part
+/// contains it, so the split is unambiguous.
+const DIGEST_SEPARATOR: char = '~';
+
+/// Descriptor metadata: device, inode, size, nanosecond mtime and ctime.
+fn metadata(stat: &Stat) -> String {
     format!(
         "{:x}:{:x}:{:x}:{:x}:{:x}:{:x}:{:x}",
         stat.st_dev,
@@ -61,6 +71,67 @@ pub fn revision(stat: &rustix::fs::Stat) -> String {
         stat.st_ctime,
         stat.st_ctime_nsec
     )
+}
+
+/// Whether the modification or change time of `stat` is within [`RACY_NANOS`]
+/// of now, or ahead of it: the metadata of such a file may not show its next write.
+fn racy(stat: &Stat) -> bool {
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_nanos() as i128);
+    let stamp = |seconds: i64, nanos: u64| i128::from(seconds) * 1_000_000_000 + i128::from(nanos);
+    let floor = now - RACY_NANOS;
+    stamp(stat.st_mtime, stat.st_mtime_nsec) >= floor || stamp(stat.st_ctime, stat.st_ctime_nsec) >= floor
+}
+
+/// A file's revision as a reader sees it: its metadata, and while that is
+/// racy, the digest of its content (`digest` is called only then). An
+/// observation, not a lock against the project's shell writers.
+pub fn revision(stat: &Stat, digest: impl FnOnce() -> Result<String, Error>) -> Result<String, Error> {
+    let mut revision = metadata(stat);
+    if racy(stat) {
+        revision.push(DIGEST_SEPARATOR);
+        revision.push_str(&digest()?);
+    }
+    Ok(revision)
+}
+
+/// Whether the opened file still is `expected`: the same metadata and, when
+/// `expected` carries a digest, the same content.
+pub fn unchanged(fd: impl AsFd, stat: &Stat, expected: &str) -> Result<bool, Error> {
+    let (recorded, digest) = match expected.split_once(DIGEST_SEPARATOR) {
+        Some((recorded, digest)) => (recorded, Some(digest)),
+        None => (expected, None),
+    };
+    if recorded != metadata(stat) {
+        return Ok(false);
+    }
+    match digest {
+        None => Ok(true),
+        Some(digest) => Ok(digest_of(fd)? == digest),
+    }
+}
+
+/// The SHA-256 of an open file's content, in hex.
+pub fn digest_of(fd: impl AsFd) -> Result<String, Error> {
+    let mut hash = Sha256::new();
+    let mut buffer = vec![0u8; CHUNK_BYTES];
+    let mut offset = 0u64;
+    loop {
+        match rustix::io::pread(&fd, &mut buffer, offset) {
+            Ok(0) => break,
+            Ok(n) => {
+                hash.update(&buffer[..n]);
+                offset += n as u64;
+            }
+            Err(rustix::io::Errno::INTR) => {}
+            Err(e) => return Err(errno("the file's content", e)),
+        }
+    }
+    Ok(hex(&hash.finalize()))
+}
+
+/// Lowercase hexadecimal of `bytes`.
+pub fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 fn kind(mode: u32) -> Kind {
@@ -211,6 +282,9 @@ pub fn download(dir: impl AsFd, path: &str, offset: u64) -> Result<Chunk, Error>
     if offset > size {
         return Err(invalid(format!("offset {offset} is past the end of {path:?} ({size} bytes)")));
     }
+    // Before the chunk is read: a later change then shows in the chunk's
+    // revision only if it also changed the content the digest was taken from.
+    let revision = revision(&stat, || digest_of(&fd))?;
     let want = usize::try_from((size - offset).min(CHUNK_BYTES as u64)).unwrap_or(CHUNK_BYTES);
     let mut data = vec![0u8; want];
     let mut read = 0;
@@ -223,7 +297,7 @@ pub fn download(dir: impl AsFd, path: &str, offset: u64) -> Result<Chunk, Error>
         }
     }
     let after = rustix::fs::fstat(&fd).map_err(|e| errno(path, e))?;
-    if revision(&stat) != revision(&after) || read != want {
+    if metadata(&stat) != metadata(&after) || read != want {
         return Err(Error::new(ErrorCode::ServiceError, "The file changed while it was read."));
     }
     data.truncate(read);
@@ -232,7 +306,7 @@ pub fn download(dir: impl AsFd, path: &str, offset: u64) -> Result<Chunk, Error>
         data_base64: base64::engine::general_purpose::STANDARD.encode(&data),
         size,
         modified: millis(&stat),
-        revision: revision(&stat),
+        revision,
         next_offset: (end < size).then_some(end),
     })
 }

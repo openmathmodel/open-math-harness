@@ -490,7 +490,9 @@ pub struct Chunk {
     pub data_base64: String,
     pub size: u64,
     pub modified: u64,
-    /// Opaque descriptor metadata, including inode and nanosecond change time.
+    /// Opaque: descriptor metadata, including inode and nanosecond change
+    /// time, plus a content digest while the file changed too recently for
+    /// that metadata to be trusted.
     pub revision: String,
     pub next_offset: Option<u64>,
 }
